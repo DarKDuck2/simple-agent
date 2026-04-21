@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from simple_agent.agent import RepoAgent
+from simple_agent.planner import HeuristicPlanner
 
 
 @dataclass(frozen=True)
@@ -50,14 +51,14 @@ class BenchmarkReport:
         return "\n".join(lines)
 
 
-def run_benchmark(cases: int = 22, trace_dir: str | None = None) -> BenchmarkReport:
+def run_benchmark(cases: int = 22, trace_dir: str | None = None, planner=None) -> BenchmarkReport:
     selected = BENCHMARK_CASES[: max(1, min(cases, len(BENCHMARK_CASES)))]
     results: list[CaseResult] = []
     with tempfile.TemporaryDirectory(prefix="repoagent-bench-") as temp_dir:
         repo = Path(temp_dir)
         _seed_repo(repo)
         for index, case in enumerate(selected, 1):
-            agent = RepoAgent(root=repo, max_steps=8)
+            agent = RepoAgent(root=repo, max_steps=8, planner=planner)
             trace_path = Path(trace_dir) / f"{index:02d}-{case.name}.jsonl" if trace_dir else None
             result = agent.run(case.task, trace_path=trace_path)
             tool_events = [event for event in result.trace.events if event.phase == "act"]
