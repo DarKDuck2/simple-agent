@@ -209,7 +209,7 @@ class HeuristicPlanner:
 
     def _build_replace_step(self, text: str) -> PlanStep | None:
         patterns = [
-            r"(?:把|将)\s+(?P<path>\S+)\s+(?:中|里的)?\s*[\"'`"](?P<old>.+?)[\"'`"]\s*(?:替换为|改成)\s*[\"'`"](?P<new>.*?)[\"'`"]",
+            r"(?:把|将)\s+(?P<path>\S+)\s+(?:中|里的)?\s*[\"'`](?P<old>.+?)[\"'`]\s*(?:替换为|改成)\s*[\"'`](?P<new>.*?)[\"']",
             r"replace\s+(?P<old>\S+)\s+with\s+(?P<new>\S+)\s+in\s+(?P<path>\S+)",
         ]
         for pattern in patterns:
@@ -228,8 +228,14 @@ class HeuristicPlanner:
         return None
 
     def _build_create_step(self, text: str) -> PlanStep | None:
-        pattern = r"(?:创建|写入|新增)\s+(?P<path>\S+)\s+(?:内容为|with content)\s*[\"'`"](?P<content>.*?)[\"'`"]"
+        # Pattern: 创建 <path> [文件] 内容为 <content>
+        # Supports: "创建 foo.py 内容为 xxx", "创建 foo.py 文件内容为 xxx"
+        pattern = r"(?:创建|写入|新增)\s+(?P<path>\S+?)\s*(?:文件\s*)?(?:内容为|with content)\s*[\"'](?P<content>.*?)[\"']"
         match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            # Try simpler pattern without quotes
+            pattern2 = r"(?:创建|写入|新增)\s+(?P<path>\S+?)\s*(?:文件\s*)?(?:内容为|with content)\s*(?P<content>\S.*)"
+            match = re.search(pattern2, text, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             return None
         return PlanStep(
@@ -358,10 +364,13 @@ def _extract_path_after(text: str, markers: list[str]) -> str | None:
 
 def _clean_phrase(text: str) -> str:
     text = text.strip().strip("：:，,。. ")
-    for stop in ["并", "然后", "，", ",", "。"]:
-        if stop in text:
-            text = text.split(stop, 1)[0]
-    return text.strip()
+    # Remove common noise words that aren't search terms
+    noise = ["所有", "包含", "的", "文件", "代码", "查找", "搜索", "在哪里", "什么"]
+    for word in noise:
+        text = text.replace(word, " ")
+    # Keep only meaningful tokens (letters, numbers, dots, underscores)
+    tokens = re.findall(r"[\w.]+", text)
+    return " ".join(tokens).strip() if tokens else text.strip()
 
 
 def _fallback_keyword(text: str) -> str:

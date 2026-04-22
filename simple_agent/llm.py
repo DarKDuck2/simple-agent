@@ -4,9 +4,10 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from simple_agent.planner import Plan, PlanStep
+if TYPE_CHECKING:
+    from simple_agent.planner import Plan, PlanStep
 
 
 class LLM(Protocol):
@@ -15,10 +16,10 @@ class LLM(Protocol):
 
 
 class LLMPlanner(Protocol):
-    def generate_plan(self, task: str, repo_context: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Plan:
+    def generate_plan(self, task: str, repo_context: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> "Plan":
         """Generate a plan for the given task using available tools."""
 
-    def reflect(self, failed_step: PlanStep, output: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[PlanStep]:
+    def reflect(self, failed_step: "PlanStep", output: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list["PlanStep"]:
         """Reflect on a failed step and generate follow-up actions."""
 
 
@@ -26,6 +27,11 @@ class LLMPlanner(Protocol):
 class UsageStats:
     input_tokens: int = 0
     output_tokens: int = 0
+
+
+def _get_planner_classes():
+    from simple_agent.planner import Plan, PlanStep
+    return Plan, PlanStep
 
 
 @dataclass
@@ -67,6 +73,7 @@ class ClaudePlanner:
         )
 
     def generate_plan(self, task: str, repo_context: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Plan:
+        Plan, PlanStep = _get_planner_classes()
         client = self._client()
         messages = self._build_messages(task, repo_context, history)
 
@@ -100,92 +107,133 @@ class ClaudePlanner:
                     PlanStep("repo_tree", {"depth": 3}, f"无法解析工具调用，先查看仓库结构。LLM 回复：{text[:200]}")
                 ])
 
-            except Exception as exc:
-                if attempt == self.max_retries - 1:
-                    raise RuntimeError(f"Claude API 调用失败（已重试 {self.max_retries} 次）：{exc}") from exc
-                time.sleep(self.retry_delay * (attempt + 1))
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (attempt + 1))
+                    continue
+                raise RuntimeError(f"LLM 调用失败：{e}") from e
 
         return Plan(goal=task, steps=[])
 
     def reflect(self, failed_step: PlanStep, output: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[PlanStep]:
-        client = self._client()
+        Plan, PlanStep = _get_planner_classes()
+        prompt = self._build_reflect_prompt(failed_step, output, history)
+        messages = [{"role": "user", "content": prompt}]
 
-        reflect_message = (
-            f"上一步操作失败了：\n"
-            f"工具：{failed_step.tool}\n"
-            f"参数：{json.dumps(failed_step.params, ensure_ascii=False)}\n"
-            f"失败输出：{output[:2000]}\n\n"
-            f"请分析失败原因，并生成后续步骤来修复问题或采用替代方案。"
-            f"如果无法修复，请直接返回空操作。"
-        )
+        try:
+            client = self._client()
+            response = client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                system=self._system_prompt(),
+                messages=messages,  # type: ignore[arg-type]
+                tools=tools,  # type: ignore[arg-type]
+                tool_choice={"type": "any"},
+            )
 
-        messages = history + [{"role": "user", "content": reflect_message}]
+            steps = self._parse_tool_uses(response.content)
+            return steps
 
-        for attempt in range(self.max_retries):
-            try:
-                response = client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    system=self._system_prompt(),
-                    messages=messages,  # type: ignore[arg-type]
-                    tools=tools,  # type: ignore[arg-type]
-                    tool_choice={"type": "auto"},
-                )
-
-                if response.usage:
-                    self._usage.append(UsageStats(
-                        input_tokens=response.usage.input_tokens,
-                        output_tokens=response.usage.output_tokens,
-                    ))
-
-                return self._parse_tool_uses(response.content)
-
-            except Exception as exc:
-                if attempt == self.max_retries - 1:
-                    return []
-                time.sleep(self.retry_delay * (attempt + 1))
-
-        return []
-
-    def total_usage(self) -> UsageStats:
-        if not self._usage:
-            return UsageStats()
-        return UsageStats(
-            input_tokens=sum(u.input_tokens for u in self._usage),
-            output_tokens=sum(u.output_tokens for u in self._usage),
-        )
+        except Exception:
+            return []
 
     def _build_messages(self, task: str, repo_context: str, history: list[dict[str, Any]]) -> list[dict[str, str]]:
-        content = (
-            f"## 任务\n{task}\n\n"
-            f"## 仓库上下文\n{repo_context}\n\n"
-            f"请生成完成此任务所需的工具调用步骤。"
+        system = (
+            f"仓库上下文：\n{repo_context}\n\n"
+            "可用工具：\n"
+            "- repo_tree(depth): 列出目录结构\n"
+            "- search_code(query, limit): 搜索代码内容\n"
+            "- read_file(path, start, max_lines): 读取文件\n"
+            "- edit_file(path, old_string, new_string): 替换文件内容\n"
+            "- file_create(path, content): 创建新文件\n"
+            "- file_delete(path): 删除文件\n"
+            "- run_shell(command): 执行 Shell 命令\n"
+            "- show_diff(): 显示差异\n"
         )
-        messages = [{"role": "user", "content": content}]
-        for msg in history:
-            role = msg.get("role", "user")
-            text = msg.get("content", "")
-            messages.append({"role": role, "content": text})
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+
+        for entry in history[-5:]:
+            if entry.get("role") in ("user", "assistant"):
+                messages.append({"role": entry["role"], "content": str(entry.get("content", ""))})
+
+        messages.append({"role": "user", "content": task})
         return messages
 
+    def _build_reflect_prompt(self, failed_step: PlanStep, output: str, history: list[dict[str, Any]]) -> str:
+        return (
+            f"上一步执行失败：\n"
+            f"- 工具：{failed_step.tool}\n"
+            f"- 参数：{failed_step.params}\n"
+            f"- 输出：{output[:500]}\n\n"
+            "请生成下一步修复方案。如果需要查看仓库结构，使用 repo_tree 工具。"
+        )
+
     def _parse_tool_uses(self, content_blocks: list[Any]) -> list[PlanStep]:
+        Plan, PlanStep = _get_planner_classes()
         steps: list[PlanStep] = []
+
         for block in content_blocks:
-            if getattr(block, "type", None) == "tool_use":
-                name = getattr(block, "name", "")
-                params = getattr(block, "input", {})
-                if name:
+            if block.type == "tool_use":
+                tool_name = block.name
+                tool_input = block.input
+
+                if tool_name == "repo_tree":
                     steps.append(PlanStep(
-                        tool=name,
-                        params=dict(params) if params else {},
-                        reason=f"LLM 选择工具 {name}",
+                        "repo_tree",
+                        {"depth": tool_input.get("depth", 3)},
+                        "查看仓库结构",
                     ))
+                elif tool_name == "search_code":
+                    steps.append(PlanStep(
+                        "search_code",
+                        {"query": tool_input.get("query", ""), "limit": tool_input.get("limit", 20)},
+                        "搜索代码",
+                    ))
+                elif tool_name == "read_file":
+                    params: dict[str, Any] = {"path": tool_input.get("path", "")}
+                    if "start" in tool_input:
+                        params["start"] = tool_input["start"]
+                    if "max_lines" in tool_input:
+                        params["max_lines"] = tool_input["max_lines"]
+                    steps.append(PlanStep("read_file", params, "读取文件"))
+                elif tool_name == "edit_file":
+                    steps.append(PlanStep(
+                        "edit_file",
+                        {
+                            "path": tool_input.get("path", ""),
+                            "old_string": tool_input.get("old_string", ""),
+                            "new_string": tool_input.get("new_string", ""),
+                        },
+                        "编辑文件",
+                    ))
+                elif tool_name == "file_create":
+                    steps.append(PlanStep(
+                        "edit_file",
+                        {"path": tool_input.get("path", ""), "mode": "overwrite", "content": tool_input.get("content", "")},
+                        "创建文件",
+                    ))
+                elif tool_name == "file_delete":
+                    steps.append(PlanStep(
+                        "edit_file",
+                        {"path": tool_input.get("path", ""), "mode": "delete"},
+                        "删除文件",
+                    ))
+                elif tool_name == "run_shell":
+                    steps.append(PlanStep(
+                        "run_shell",
+                        {"command": tool_input.get("command", "")},
+                        "执行命令",
+                    ))
+                elif tool_name == "show_diff":
+                    steps.append(PlanStep("show_diff", {}, "查看差异"))
+
         return steps
 
 
 @dataclass
 class OpenAIPlanner:
-    """OpenAI-compatible planner using function calling protocol."""
+    """OpenAI-based planner with function calling support."""
 
     model: str = "gpt-4o"
     max_retries: int = 3
@@ -209,215 +257,163 @@ class OpenAIPlanner:
             kwargs["base_url"] = self.base_url
         return openai.OpenAI(**kwargs)
 
+    def _system_prompt(self) -> str:
+        return (
+            "你是一个面向代码仓库的 AI 编程助手。你的任务是根据用户需求，"
+            "选择合适的工具来完成代码理解、搜索、阅读和编辑等操作。\n\n"
+            "规则：\n"
+            "1. 分析用户任务，选择合适的工具步骤\n"
+            "2. 每一步只选择一个工具，并提供精确的参数\n"
+            "3. 如果需要多步操作，按顺序列出所有步骤\n"
+            "4. 对于文件编辑操作，必须确保 old_string 在目标文件中唯一存在\n"
+            "5. 如果任务需要验证（如修改后运行测试），请在最后添加验证步骤\n"
+        )
+
     def generate_plan(self, task: str, repo_context: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> Plan:
+        Plan, PlanStep = _get_planner_classes()
         client = self._client()
         messages = self._build_messages(task, repo_context, history)
-        openai_tools = self._convert_tools(tools)
 
         for attempt in range(self.max_retries):
             try:
                 response = client.chat.completions.create(
                     model=self.model,
-                    messages=messages,  # type: ignore[arg-type]
-                    tools=openai_tools if openai_tools else None,
-                    tool_choice="auto" if openai_tools else None,
-                    temperature=0,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice={"type": "automatic"},
                 )
 
-                if response.usage:
-                    self._usage.append(UsageStats(
-                        input_tokens=response.usage.prompt_tokens,
-                        output_tokens=response.usage.completion_tokens,
-                    ))
-
                 message = response.choices[0].message
-                steps = self._parse_tool_calls(message)
-                if steps:
-                    return Plan(goal=task, steps=steps)
+                if message.tool_calls:
+                    steps = self._parse_tool_calls(message.tool_calls)
+                    if steps:
+                        return Plan(goal=task, steps=steps)
 
                 text = message.content or ""
                 return Plan(goal=task, steps=[
                     PlanStep("repo_tree", {"depth": 3}, f"无法解析工具调用，先查看仓库结构。LLM 回复：{text[:200]}")
                 ])
 
-            except Exception as exc:
-                if attempt == self.max_retries - 1:
-                    raise RuntimeError(f"OpenAI API 调用失败（已重试 {self.max_retries} 次）：{exc}") from exc
-                time.sleep(self.retry_delay * (attempt + 1))
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (attempt + 1))
+                    continue
+                raise RuntimeError(f"LLM 调用失败：{e}") from e
 
         return Plan(goal=task, steps=[])
 
     def reflect(self, failed_step: PlanStep, output: str, history: list[dict[str, Any]], tools: list[dict[str, Any]]) -> list[PlanStep]:
-        client = self._client()
+        Plan, PlanStep = _get_planner_classes()
+        prompt = self._build_reflect_prompt(failed_step, output, history)
+        messages = [{"role": "system", "content": self._system_prompt()}, {"role": "user", "content": prompt}]
 
-        reflect_message = (
-            f"上一步操作失败了：\n"
-            f"工具：{failed_step.tool}\n"
-            f"参数：{json.dumps(failed_step.params, ensure_ascii=False)}\n"
-            f"失败输出：{output[:2000]}\n\n"
-            f"请分析失败原因，并生成后续步骤来修复问题或采用替代方案。"
-        )
+        try:
+            client = self._client()
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice={"type": "automatic"},
+            )
 
-        messages = history + [{"role": "user", "content": reflect_message}]
-        openai_tools = self._convert_tools(tools)
+            message = response.choices[0].message
+            if message.tool_calls:
+                return self._parse_tool_calls(message.tool_calls)
 
-        for attempt in range(self.max_retries):
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,  # type: ignore[arg-type]
-                    tools=openai_tools if openai_tools else None,
-                    tool_choice="auto" if openai_tools else None,
-                    temperature=0,
-                )
-
-                if response.usage:
-                    self._usage.append(UsageStats(
-                        input_tokens=response.usage.prompt_tokens,
-                        output_tokens=response.usage.completion_tokens,
-                    ))
-
-                steps = self._parse_tool_calls(response.choices[0].message)
-                return steps
-
-            except Exception as exc:
-                if attempt == self.max_retries - 1:
-                    return []
-                time.sleep(self.retry_delay * (attempt + 1))
+        except Exception:
+            pass
 
         return []
 
-    def total_usage(self) -> UsageStats:
-        if not self._usage:
-            return UsageStats()
-        return UsageStats(
-            input_tokens=sum(u.input_tokens for u in self._usage),
-            output_tokens=sum(u.output_tokens for u in self._usage),
-        )
-
     def _build_messages(self, task: str, repo_context: str, history: list[dict[str, Any]]) -> list[dict[str, str]]:
         system = (
-            "你是一个面向代码仓库的 AI 编程助手。"
-            "分析用户任务，选择合适的工具来完成代码理解、搜索、阅读和编辑等操作。"
+            f"仓库上下文：\n{repo_context}\n\n"
+            "可用工具：\n"
+            "- repo_tree(depth): 列出目录结构\n"
+            "- search_code(query, limit): 搜索代码内容\n"
+            "- read_file(path, start, max_lines): 读取文件\n"
+            "- edit_file(path, old_string, new_string): 替换文件内容\n"
+            "- file_create(path, content): 创建新文件\n"
+            "- file_delete(path): 删除文件\n"
+            "- run_shell(command): 执行 Shell 命令\n"
+            "- show_diff(): 显示差异\n"
         )
-        content = (
-            f"## 任务\n{task}\n\n"
-            f"## 仓库上下文\n{repo_context}\n\n"
-            f"请生成完成此任务所需的工具调用步骤。"
-        )
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ]
-        for msg in history:
-            role = msg.get("role", "user")
-            text = msg.get("content", "")
-            messages.append({"role": role, "content": text})
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+
+        for entry in history[-5:]:
+            if entry.get("role") in ("user", "assistant"):
+                messages.append({"role": entry["role"], "content": str(entry.get("content", ""))})
+
+        messages.append({"role": "user", "content": task})
         return messages
 
-    def _convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Convert Anthropic-style tools to OpenAI function calling format."""
-        result: list[dict[str, Any]] = []
-        for tool in tools:
-            result.append({
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {}),
-                },
-            })
-        return result
-
-    def _parse_tool_calls(self, message: Any) -> list[PlanStep]:
-        steps: list[PlanStep] = []
-        for call in getattr(message, "tool_calls", []) or []:
-            name = getattr(getattr(call, "function", None), "name", "")
-            args_str = getattr(getattr(call, "function", None), "arguments", "{}")
-            try:
-                params = json.loads(args_str) if args_str else {}
-            except json.JSONDecodeError:
-                params = {}
-            if name:
-                steps.append(PlanStep(
-                    tool=name,
-                    params=params,
-                    reason=f"LLM 选择工具 {name}",
-                ))
-        return steps
-
-
-class MockLLM:
-    """A deterministic LLM stub for learning the agent loop without an API key."""
-
-    def infer(self, messages: list[dict[str, str]]) -> str:
-        latest = messages[-1]
-
-        if latest["role"] == "tool":
-            return f"工具返回结果：{latest['content']}\n\n基于这个结果，我的最终回答如上。"
-
-        user_text = messages[-1]["content"]
-        lowered = user_text.lower()
-
-        if any(word in user_text for word in ["运行代码", "执行代码", "code"]):
-            code = user_text.replace("运行代码", "").replace("执行代码", "").strip()
-            return _function_call("code_run", {"code": code})
-
-        if any(word in user_text for word in ["搜索", "查找", "查询"]) or "search" in lowered:
-            query = user_text.replace("搜索一下", "").replace("搜索", "").strip()
-            return _function_call("search", {"query": query})
-
-        if any(word in user_text for word in ["算", "计算", "+", "-", "*", "/", "(", ")"]):
-            expression = (
-                user_text.replace("帮我算一下", "")
-                .replace("计算", "")
-                .replace("算一下", "")
-                .strip()
-            )
-            return _function_call("calculator", {"expression": expression})
-
-        return f"这是一个无需调用工具的问题。你问的是：{user_text}"
-
-
-class OpenAIChatLLM:
-    """Minimal OpenAI adapter. Prefer official tool calling in real projects."""
-
-    def __init__(self, model: str = "gpt-4o-mini") -> None:
-        self.model = model
-
-    def infer(self, messages: list[dict[str, str]]) -> str:
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("请先安装 openai：pip install openai") from exc
-
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise RuntimeError("请先设置环境变量 OPENAI_API_KEY")
-
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=_to_openai_messages(messages),  # type: ignore[arg-type]
-            temperature=0,
+    def _build_reflect_prompt(self, failed_step: PlanStep, output: str, history: list[dict[str, Any]]) -> str:
+        return (
+            f"上一步执行失败：\n"
+            f"- 工具：{failed_step.tool}\n"
+            f"- 参数：{failed_step.params}\n"
+            f"- 输出：{output[:500]}\n\n"
+            "请生成下一步修复方案。如果需要查看仓库结构，使用 repo_tree 工具。"
         )
-        return response.choices[0].message.content or ""
 
+    def _parse_tool_calls(self, tool_calls: Any) -> list[PlanStep]:
+        Plan, PlanStep = _get_planner_classes()
+        steps: list[PlanStep] = []
 
-def _function_call(name: str, params: dict[str, str]) -> str:
-    payload = json.dumps({"name": name, "params": params}, ensure_ascii=False)
-    return f"<|FunctionCall|>{payload}<|End|>"
+        for call in tool_calls:
+            func = call.function
+            name = func.name
+            arguments = json.loads(func.arguments)
 
+            if name == "repo_tree":
+                steps.append(PlanStep(
+                    "repo_tree",
+                    {"depth": arguments.get("depth", 3)},
+                    "查看仓库结构",
+                ))
+            elif name == "search_code":
+                steps.append(PlanStep(
+                    "search_code",
+                    {"query": arguments.get("query", ""), "limit": arguments.get("limit", 20)},
+                    "搜索代码",
+                ))
+            elif name == "read_file":
+                params = {"path": arguments.get("path", "")}
+                if "start" in arguments:
+                    params["start"] = arguments["start"]
+                if "max_lines" in arguments:
+                    params["max_lines"] = arguments["max_lines"]
+                steps.append(PlanStep("read_file", params, "读取文件"))
+            elif name == "edit_file":
+                steps.append(PlanStep(
+                    "edit_file",
+                    {
+                        "path": arguments.get("path", ""),
+                        "old_string": arguments.get("old_string", ""),
+                        "new_string": arguments.get("new_string", ""),
+                    },
+                    "编辑文件",
+                ))
+            elif name == "file_create":
+                steps.append(PlanStep(
+                    "edit_file",
+                    {"path": arguments.get("path", ""), "mode": "overwrite", "content": arguments.get("content", "")},
+                    "创建文件",
+                ))
+            elif name == "file_delete":
+                steps.append(PlanStep(
+                    "edit_file",
+                    {"path": arguments.get("path", ""), "mode": "delete"},
+                    "删除文件",
+                ))
+            elif name == "run_shell":
+                steps.append(PlanStep(
+                    "run_shell",
+                    {"command": arguments.get("command", "")},
+                    "执行命令",
+                ))
+            elif name == "show_diff":
+                steps.append(PlanStep("show_diff", {}, "查看差异"))
 
-def _to_openai_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    converted: list[dict[str, str]] = []
-    for message in messages:
-        if message["role"] == "tool":
-            converted.append(
-                {
-                    "role": "user",
-                    "content": f"工具返回结果：\n{message['content']}",
-                }
-            )
-        else:
-            converted.append(message)
-    return converted
+        return steps
